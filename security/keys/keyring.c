@@ -37,11 +37,14 @@ static inline bool keyring_ptr_is_keyring(const struct assoc_array_ptr *x)
 {
 	return (unsigned long)x & KEYRING_PTR_SUBTYPE;
 }
-static inline struct key *keyring_ptr_to_key(const struct assoc_array_ptr *x)
+
+inline struct key *keyring_ptr_to_key(const struct assoc_array_ptr *x)
 {
 	void *object = assoc_array_ptr_to_leaf(x);
 	return (struct key *)((unsigned long)object & ~KEYRING_PTR_SUBTYPE);
 }
+EXPORT_SYMBOL_GPL(keyring_ptr_to_key);
+
 static inline void *keyring_key_to_ptr(struct key *key)
 {
 	if (key->type == &key_type_keyring)
