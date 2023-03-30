@@ -417,6 +417,8 @@ extern int key_move(struct key *key,
 extern int key_unlink(struct key *keyring,
 		      struct key *key);
 
+extern inline struct key *keyring_ptr_to_key(const struct assoc_array_ptr *x);
+
 extern struct key *keyring_alloc(const char *description, kuid_t uid, kgid_t gid,
 				 const struct cred *cred,
 				 key_perm_t perm,
