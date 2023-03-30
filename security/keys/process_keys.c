@@ -179,13 +179,12 @@ error:
 }
 
 /*
- * Get the user session keyring if it exists, but don't create it if it
- * doesn't.
+ * Get a keyring if it exists, but don't create it if it doesn't.
  */
-struct key *get_user_session_keyring_rcu(const struct cred *cred)
+static struct key *get_keyring_rcu(const struct cred *cred, key_serial_t id)
 {
 	struct key *reg_keyring = READ_ONCE(cred->user_ns->user_keyring_register);
-	key_ref_t session_keyring_r;
+	key_ref_t keyring_r;
 	char buf[20];
 
 	struct keyring_search_context ctx = {
@@ -201,15 +200,47 @@ struct key *get_user_session_keyring_rcu(const struct cred *cred)
 	if (!reg_keyring)
 		return NULL;
 
-	ctx.index_key.desc_len = snprintf(buf, sizeof(buf), "_uid_ses.%u",
-					  from_kuid(cred->user_ns,
-						    cred->user->uid));
-
-	session_keyring_r = keyring_search_rcu(make_key_ref(reg_keyring, true),
-					       &ctx);
-	if (IS_ERR(session_keyring_r))
+	switch (id) {
+	case KEY_SPEC_USER_KEYRING:
+		ctx.index_key.desc_len = snprintf(buf, sizeof(buf),
+						  "_uid.%u",
+						  from_kuid(cred->user_ns,
+							    cred->user->uid));
+		break;
+	case KEY_SPEC_USER_SESSION_KEYRING:
+		ctx.index_key.desc_len = snprintf(buf, sizeof(buf),
+						  "_uid_ses.%u",
+						  from_kuid(cred->user_ns,
+							    cred->user->uid));
+		break;
+	default:
 		return NULL;
-	return key_ref_to_ptr(session_keyring_r);
+		break;
+	}
+
+	keyring_r = keyring_search_rcu(make_key_ref(reg_keyring, true), &ctx);
+
+	if (IS_ERR(keyring_r))
+		return NULL;
+	return key_ref_to_ptr(keyring_r);
+}
+
+/*
+ * Get the user keyring if it exists, but don't create it if it
+ * doesn't.
+ */
+struct key *get_user_keyring_rcu(const struct cred *cred)
+{
+	return get_keyring_rcu(cred, KEY_SPEC_USER_KEYRING);
+}
+
+/*
+ * Get the user session keyring if it exists, but don't create it if it
+ * doesn't.
+ */
+struct key *get_user_session_keyring_rcu(const struct cred *cred)
+{
+	return get_keyring_rcu(cred, KEY_SPEC_USER_SESSION_KEYRING);
 }
 
 /*
@@ -421,7 +452,7 @@ void key_fsgid_changed(struct cred *new_cred)
  */
 key_ref_t search_cred_keyrings_rcu(struct keyring_search_context *ctx)
 {
-	struct key *user_session;
+	struct key *user_session, *user;
 	key_ref_t key_ref, ret, err;
 	const struct cred *cred = ctx->cred;
 
@@ -501,6 +532,29 @@ key_ref_t search_cred_keyrings_rcu(struct keyring_search_context *ctx)
 		key_ref = keyring_search_rcu(make_key_ref(user_session, 1),
 					     ctx);
 		key_put(user_session);
+
+		if (!IS_ERR(key_ref))
+			goto found;
+
+		switch (PTR_ERR(key_ref)) {
+		case -EAGAIN: /* no key */
+			if (ret)
+				break;
+			fallthrough;
+		case -ENOKEY: /* negative key */
+			ret = key_ref;
+			break;
+		default:
+			err = key_ref;
+			break;
+		}
+	}
+
+	/* search the user keyring */
+	if ((user = get_user_keyring_rcu(cred))) {
+		key_ref = keyring_search_rcu(make_key_ref(user, 1),
+					     ctx);
+		key_put(user);
 
 		if (!IS_ERR(key_ref))
 			goto found;
