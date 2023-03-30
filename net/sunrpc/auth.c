@@ -565,7 +565,7 @@ found:
 	if (test_bit(RPCAUTH_CRED_NEW, &cred->cr_flags) &&
 	    cred->cr_ops->cr_init != NULL &&
 	    !(flags & RPCAUTH_LOOKUP_NEW)) {
-		int res = cred->cr_ops->cr_init(auth, cred);
+		int res = cred->cr_ops->cr_init(auth, cred, NULL);
 		if (res < 0) {
 			put_rpccred(cred);
 			cred = ERR_PTR(res);
@@ -683,11 +683,11 @@ rpcauth_bindcred(struct rpc_task *task, const struct cred *cred, int flags)
 	return 0;
 }
 
-void
+bool
 put_rpccred(struct rpc_cred *cred)
 {
 	if (cred == NULL)
-		return;
+		return false;
 	rcu_read_lock();
 	if (refcount_dec_and_test(&cred->cr_count))
 		goto destroy;
@@ -707,10 +707,11 @@ put_rpccred(struct rpc_cred *cred)
 	}
 out:
 	rcu_read_unlock();
-	return;
+	return false;
 destroy:
 	rcu_read_unlock();
 	cred->cr_ops->crdestroy(cred);
+	return true;
 }
 EXPORT_SYMBOL_GPL(put_rpccred);
 

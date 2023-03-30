@@ -28,11 +28,25 @@
 #include <linux/sunrpc/gss_api.h>
 #include <linux/uaccess.h>
 #include <linux/hashtable.h>
+#include <linux/key.h>
+#include <linux/keyctl.h>
+#include <linux/key-type.h>
+#include <keys/user-type.h>
+#include <keys/request_key_auth-type.h>
 
 #include "auth_gss_internal.h"
 #include "../netns.h"
 
 #include <trace/events/rpcgss.h>
+
+#define UINT_MAX_LEN 11
+static const char CLID_PREFIX[] = "clid:";
+static const char ID_PREFIX[] = "id:";
+static const char PRINC_PREFIX[] = "princ:";
+static const char PRINC_NONE[] = "princ:(none)";
+static struct key_type key_type_gss_cred;
+
+void gss_key_destroy(struct key *key);
 
 static const struct rpc_authops authgss_ops;
 
@@ -44,6 +58,8 @@ static unsigned int gss_expired_cred_retry_delay = GSS_RETRY_EXPIRED;
 
 #define GSS_KEY_EXPIRE_TIMEO 240
 static unsigned int gss_key_expire_timeo = GSS_KEY_EXPIRE_TIMEO;
+
+static bool use_keyring;
 
 #if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
 # define RPCDBG_FACILITY	RPCDBG_AUTH
@@ -98,6 +114,14 @@ struct gss_auth {
 	 */
 	struct gss_pipe *gss_pipe[2];
 	const char *target_name;
+	struct cred *keyring_cred;
+};
+
+struct gss_auxdata {
+	struct rpc_auth *auth;
+	struct auth_cred *acred;
+	int flags;
+	gfp_t gfp;
 };
 
 /* pipe_version >= 0 if and only if someone has a pipe open. */
@@ -174,7 +198,8 @@ gss_alloc_context(void)
 
 #define GSSD_MIN_TIMEOUT (60 * 60)
 static const void *
-gss_fill_context(const void *p, const void *end, struct gss_cl_ctx *ctx, struct gss_api_mech *gm)
+gss_fill_context(const void *p, const void *end, struct gss_cl_ctx *ctx,
+		 struct gss_api_mech *gm, unsigned int *tout)
 {
 	const void *q;
 	unsigned int seclen;
@@ -192,6 +217,7 @@ gss_fill_context(const void *p, const void *end, struct gss_cl_ctx *ctx, struct 
 		goto err;
 	if (timeout == 0)
 		timeout = GSSD_MIN_TIMEOUT;
+	*tout = timeout;
 	ctx->gc_expiry = now + ((unsigned long)timeout * HZ);
 	/* Sequence number window. Determines the maximum number of
 	 * simultaneous requests
@@ -267,6 +293,8 @@ struct gss_upcall_msg {
 	struct rpc_wait_queue rpc_waitqueue;
 	wait_queue_head_t waitqueue;
 	struct gss_cl_ctx *ctx;
+	struct key *authkey;
+	unsigned int timeout;
 	char databuf[UPCALL_BUF_LEN];
 };
 
@@ -559,7 +587,8 @@ err:
 }
 
 static struct gss_upcall_msg *
-gss_setup_upcall(struct gss_auth *gss_auth, struct rpc_cred *cred)
+gss_setup_upcall(struct gss_auth *gss_auth, struct rpc_cred *cred,
+		 struct key *authkey)
 {
 	struct gss_cred *gss_cred = container_of(cred,
 			struct gss_cred, gc_base);
@@ -572,6 +601,7 @@ gss_setup_upcall(struct gss_auth *gss_auth, struct rpc_cred *cred)
 	gss_msg = gss_add_msg(gss_new);
 	if (gss_msg == gss_new) {
 		int res;
+		gss_msg->authkey = authkey;
 		refcount_inc(&gss_msg->count);
 		res = rpc_queue_upcall(gss_new->pipe, &gss_new->msg);
 		if (res) {
@@ -602,7 +632,7 @@ gss_refresh_upcall(struct rpc_task *task)
 	struct rpc_pipe *pipe;
 	int err = 0;
 
-	gss_msg = gss_setup_upcall(gss_auth, cred);
+	gss_msg = gss_setup_upcall(gss_auth, cred, NULL);
 	if (PTR_ERR(gss_msg) == -EAGAIN) {
 		/* XXX: warning on the first, under the assumption we
 		 * shouldn't normally hit this case on a refresh. */
@@ -638,16 +668,23 @@ out:
 }
 
 static inline int
-gss_create_upcall(struct gss_auth *gss_auth, struct gss_cred *gss_cred)
+gss_create_upcall(struct gss_auth *gss_auth, struct gss_cred *gss_cred,
+		  struct key *authkey)
 {
 	struct net *net = gss_auth->net;
 	struct sunrpc_net *sn = net_generic(net, sunrpc_net_id);
 	struct rpc_pipe *pipe;
 	struct rpc_cred *cred = &gss_cred->gc_base;
 	struct gss_upcall_msg *gss_msg;
+	struct request_key_auth *rka;
+	struct key *key;
 	DEFINE_WAIT(wait);
 	int err;
 
+	if (use_keyring) {
+		rka = get_request_key_auth(authkey);
+		key = rka->target_key;
+	}
 retry:
 	err = 0;
 	/* if gssd is down, just skip upcalling altogether */
@@ -656,7 +693,7 @@ retry:
 		err = -EACCES;
 		goto out;
 	}
-	gss_msg = gss_setup_upcall(gss_auth, cred);
+	gss_msg = gss_setup_upcall(gss_auth, cred, authkey);
 	if (PTR_ERR(gss_msg) == -EAGAIN) {
 		err = wait_event_interruptible_timeout(pipe_version_waitqueue,
 				sn->pipe_version >= 0, 15 * HZ);
@@ -689,6 +726,17 @@ retry:
 	if (gss_msg->ctx) {
 		trace_rpcgss_ctx_init(gss_cred);
 		gss_cred_set_ctx(cred, gss_msg->ctx);
+		if (use_keyring) {
+			err = key_instantiate_and_link(key, gss_cred,
+						       sizeof(gss_cred),
+						       NULL, authkey);
+			if (!err) {
+				key_set_timeout(key, gss_msg->timeout);
+				err = key_link(gss_auth->keyring_cred->thread_keyring,
+					       key);
+			}
+			complete_request_key(authkey, err);
+		}
 	} else {
 		err = gss_msg->msg.errno;
 	}
@@ -771,7 +819,8 @@ gss_pipe_downcall(struct file *filp, const char __user *src, size_t mlen)
 	list_del_init(&gss_msg->list);
 	spin_unlock(&pipe->lock);
 
-	p = gss_fill_context(p, end, ctx, gss_msg->auth->mech);
+	p = gss_fill_context(p, end, ctx, gss_msg->auth->mech,
+			     &gss_msg->timeout);
 	if (IS_ERR(p)) {
 		err = PTR_ERR(p);
 		switch (err) {
@@ -1032,6 +1081,8 @@ gss_create_new(const struct rpc_auth_create_args *args, struct rpc_clnt *clnt)
 	struct gss_pipe *gss_pipe;
 	struct rpc_auth * auth;
 	int err = -ENOMEM; /* XXX? */
+	struct cred *cred;
+	struct key *keyring;
 
 	if (!try_module_get(THIS_MODULE))
 		return ERR_PTR(err);
@@ -1094,7 +1145,34 @@ gss_create_new(const struct rpc_auth_create_args *args, struct rpc_clnt *clnt)
 	}
 	gss_auth->gss_pipe[0] = gss_pipe;
 
+	if (use_keyring) {
+		cred = prepare_kernel_cred(&init_task);
+		if (!cred) {
+			err = -ENOMEM;
+			goto err_destroy_pipe_0;
+		}
+		keyring = keyring_alloc("gss_keyring",
+					GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, cred,
+					(KEY_POS_ALL & ~KEY_POS_SETATTR) |
+					KEY_USR_VIEW | KEY_USR_READ,
+					KEY_ALLOC_NOT_IN_QUOTA, NULL, NULL);
+		if (IS_ERR(keyring)) {
+			err = PTR_ERR(keyring);
+			goto err_destroy_cred;
+		}
+		set_bit(KEY_FLAG_ROOT_CAN_CLEAR, &keyring->flags);
+		cred->thread_keyring = keyring;
+		cred->jit_keyring = KEY_REQKEY_DEFL_THREAD_KEYRING;
+		gss_auth->keyring_cred = cred;
+	}
+
+	trace_rpcgss_createauth(flavor, err, gss_auth->keyring_cred ?
+				gss_auth->keyring_cred->thread_keyring : NULL);
 	return gss_auth;
+err_destroy_cred:
+	put_cred(cred);
+err_destroy_pipe_0:
+	gss_pipe_free(gss_auth->gss_pipe[0]);
 err_destroy_pipe_1:
 	gss_pipe_free(gss_auth->gss_pipe[1]);
 err_destroy_credcache:
@@ -1108,7 +1186,8 @@ err_free:
 	kfree(gss_auth);
 out_dec:
 	module_put(THIS_MODULE);
-	trace_rpcgss_createauth(flavor, err);
+	trace_rpcgss_createauth(flavor, err, gss_auth->keyring_cred ?
+				gss_auth->keyring_cred->thread_keyring : NULL);
 	return ERR_PTR(err);
 }
 
@@ -1139,6 +1218,19 @@ gss_put_auth(struct gss_auth *gss_auth)
 	kref_put(&gss_auth->kref, gss_free_callback);
 }
 
+static bool gss_key_gc_iterator(void *object, void *__unused)
+{
+	struct key *key = keyring_ptr_to_key(object);
+	struct gss_cred *cred = key->payload.data[0];
+
+	if (cred && put_rpccred(&cred->gc_base)) {
+		key->payload.data[0] = NULL;
+		return false;
+	}
+	key_get(key);
+	return true;
+}
+
 static void
 gss_destroy(struct rpc_auth *auth)
 {
@@ -1156,6 +1248,13 @@ gss_destroy(struct rpc_auth *auth)
 	gss_pipe_free(gss_auth->gss_pipe[1]);
 	gss_auth->gss_pipe[1] = NULL;
 	rpcauth_destroy_credcache(auth);
+
+	if (use_keyring) {
+		keyring_gc_custom(gss_auth->keyring_cred->thread_keyring,
+				  &gss_key_gc_iterator, NULL);
+		key_revoke(gss_auth->keyring_cred->thread_keyring);
+		put_cred(gss_auth->keyring_cred);
+	}
 
 	gss_put_auth(gss_auth);
 }
@@ -1369,14 +1468,109 @@ gss_hash_cred(struct auth_cred *acred, unsigned int hashbits)
 	return hash_64(from_kuid(&init_user_ns, acred->cred->fsuid), hashbits);
 }
 
+static struct key *gss_request_key(struct rpc_auth *auth,
+				   struct auth_cred *acred,
+				   int flags, gfp_t gfp)
+{
+	struct gss_auth *gss_auth = container_of(auth, struct gss_auth, rpc_auth);
+	struct key *key;
+	struct gss_auxdata *aux;
+	char clid_str[UINT_MAX_LEN];
+	char id_str[UINT_MAX_LEN];
+	char *desc;
+	int clid_len, id_len, desclen;
+	struct key *dest_keyring;
+	key_ref_t keyref;
+
+	keyref = lookup_user_key(KEY_SPEC_USER_KEYRING,
+				 KEY_LOOKUP_CREATE, KEY_NEED_SEARCH);
+	if (IS_ERR(keyref))
+		return ERR_CAST(keyref);
+	dest_keyring = key_ref_to_ptr(keyref);
+
+	clid_len = snprintf(clid_str, sizeof(clid_str), "%u",
+			    gss_auth->client->cl_clid);
+	id_len = snprintf(id_str, sizeof(id_str), "%u",
+			  from_kuid(&init_user_ns, acred->cred->fsuid));
+
+	desclen = sizeof(CLID_PREFIX) + clid_len + 1 +
+			sizeof(ID_PREFIX) + id_len;
+
+	if (acred->principal)
+		desclen += (1 + sizeof(PRINC_PREFIX) + strlen(acred->principal));
+	else
+		desclen += (1 + sizeof(PRINC_NONE));
+
+	desc = kmalloc(desclen, GFP_KERNEL);
+	if (!desc)
+		return ERR_PTR(-ENOMEM);
+
+	if (acred->principal)
+		sprintf(desc, "%s%s %s%s %s%s", CLID_PREFIX, clid_str,
+			ID_PREFIX, id_str, PRINC_PREFIX, acred->principal);
+	else
+		sprintf(desc, "%s%s %s%s %s", CLID_PREFIX, clid_str,
+			ID_PREFIX, id_str, PRINC_NONE);
+
+	aux = kzalloc(sizeof(*aux), gfp);
+	if (!aux)
+		return ERR_PTR(-ENOMEM);
+
+	aux->auth = auth;
+	aux->acred = acred;
+	aux->flags = flags;
+	aux->gfp = gfp;
+
+	key = request_key_with_auxdata(&key_type_gss_cred, desc,
+				       NULL, "", 0, aux, dest_keyring);
+	kfree(aux);
+	kfree(desc);
+	return key;
+}
+
+static struct rpc_cred *
+gss_lookup_keyring(struct rpc_auth *auth, struct auth_cred *acred,
+		   int flags, gfp_t gfp)
+{
+	struct key *key;
+	struct gss_cred *gss_cred;
+	struct rpc_cred *cred = NULL;
+	const struct cred *saved_cred;
+
+	saved_cred = override_creds(acred->cred);
+	key = gss_request_key(auth, acred, flags, rpc_task_gfp_mask());
+	trace_rpcgss_request_key_result(acred, key);
+	if (IS_ERR(key)) {
+		cred = ERR_CAST(key);
+		goto out;
+	}
+	down_read(&key->sem);
+	gss_cred = key->payload.data[0];
+	if (!gss_cred) {
+		cred = ERR_PTR(-ENOKEY);
+		goto out_up;
+	}
+	cred = get_rpccred(&gss_cred->gc_base);
+out_up:
+	up_read(&key->sem);
+	key_put(key);
+out:
+	revert_creds(saved_cred);
+	return cred;
+}
+
 /*
  * Lookup RPCSEC_GSS cred for the current process
  */
 static struct rpc_cred *gss_lookup_cred(struct rpc_auth *auth,
 					struct auth_cred *acred, int flags)
 {
-	return rpcauth_lookup_credcache(auth, acred, flags,
-					rpc_task_gfp_mask());
+	if (use_keyring)
+		return gss_lookup_keyring(auth, acred, flags,
+					  rpc_task_gfp_mask());
+	else
+		return rpcauth_lookup_credcache(auth, acred, flags,
+						rpc_task_gfp_mask());
 }
 
 static struct rpc_cred *
@@ -1405,17 +1599,127 @@ out_err:
 }
 
 static int
-gss_cred_init(struct rpc_auth *auth, struct rpc_cred *cred)
+gss_cred_init(struct rpc_auth *auth, struct rpc_cred *cred, struct key *authkey)
 {
 	struct gss_auth *gss_auth = container_of(auth, struct gss_auth, rpc_auth);
 	struct gss_cred *gss_cred = container_of(cred,struct gss_cred, gc_base);
 	int err;
 
 	do {
-		err = gss_create_upcall(gss_auth, gss_cred);
+		err = gss_create_upcall(gss_auth, gss_cred, authkey);
 	} while (err == -EAGAIN);
 	return err;
 }
+
+static bool gss_cmp(const struct key *key,
+		    const struct key_match_data *match_data)
+{
+	struct gss_cred *gss_cred = rcu_dereference(key->payload.rcu_data0);
+	struct rpc_cred *rc;
+	struct gss_cl_ctx *ctx;
+	bool ret;
+
+	if (!gss_cred)
+		return false;
+
+	rc = &gss_cred->gc_base;
+
+	if (test_bit(RPCAUTH_CRED_NEW, &rc->cr_flags))
+		goto out;
+	/* Don't match with creds that have expired. */
+	ctx = rcu_dereference(gss_cred->gc_ctx);
+	if (!ctx || time_after(jiffies, ctx->gc_expiry)) {
+		rcu_read_unlock();
+		return false;
+	}
+	if (!test_bit(RPCAUTH_CRED_UPTODATE, &rc->cr_flags)) {
+		return false;
+	}
+out:
+	ret = strcmp(key->description, match_data->raw_data) == 0;
+	return ret;
+}
+
+static int gss_match_preparse(struct key_match_data *match_data)
+{
+	match_data->cmp = gss_cmp;
+	match_data->lookup_type = KEYRING_SEARCH_LOOKUP_ITERATE;
+	return 0;
+}
+
+static int gss_request_key_upcall(struct key *authkey, void *aux)
+{
+	struct gss_auxdata *data = aux;
+	struct rpc_auth *auth = data->auth;
+	struct auth_cred *acred = data->acred;
+	int flags = data->flags;
+	gfp_t gfp = data->gfp;
+	struct rpc_cred *cred;
+	int ret;
+
+	cred = gss_create_cred(auth, acred, flags, gfp);
+	if (IS_ERR(cred)) {
+		ret = PTR_ERR(cred);
+		complete_request_key(authkey, ret);
+		return ret;
+	}
+
+	ret = gss_cred_init(auth, cred, authkey);
+	if (ret < 0) {
+		complete_request_key(authkey, ret);
+	}
+
+	return ret;
+}
+
+void gss_key_revoke(struct key *key)
+{
+	struct gss_cred *cred = key->payload.data[0];
+
+	if (cred && put_rpccred(&cred->gc_base))
+		key->payload.data[0] = NULL;
+}
+
+void gss_key_destroy(struct key *key)
+{
+	struct gss_cred *cred = key->payload.data[0];
+
+	if (cred && put_rpccred(&cred->gc_base))
+		key->payload.data[0] = NULL;
+}
+
+void gss_describe(const struct key *key, struct seq_file *m)
+{
+	struct gss_cred *gss_cred = key->payload.data[0];
+
+	if (!gss_cred)
+		return;
+
+	seq_puts(m, key->description);
+	if (key_is_positive(key)) {
+		seq_printf(m, " gc: %px", gss_cred);
+	}
+}
+
+int gss_key_instantiate(struct key *key, struct key_preparsed_payload *prep)
+{
+	if (prep->datalen != key->type->def_datalen)
+		return -EINVAL;
+
+	rcu_assign_keypointer(key, (struct gss_cred *)prep->data);
+	return 0;
+}
+
+static struct key_type key_type_gss_cred = {
+	.name = "gss_cred",
+	.def_datalen	= sizeof(struct gss_cred *),
+	.instantiate	= gss_key_instantiate,
+	.match_preparse = gss_match_preparse,
+	.revoke		= gss_key_revoke,
+	.destroy	= gss_key_destroy,
+	.describe	= gss_describe,
+	.request_key	= gss_request_key_upcall,
+};
 
 static char *
 gss_stringify_acceptor(struct rpc_cred *cred)
@@ -2261,6 +2565,11 @@ static int __init init_rpcsec_gss(void)
 	err = register_pernet_subsys(&rpcsec_gss_net_ops);
 	if (err)
 		goto out_svc_exit;
+	if (use_keyring) {
+		err = register_key_type(&key_type_gss_cred);
+		if (err)
+			goto out_svc_exit;
+	}
 	rpc_init_wait_queue(&pipe_version_rpc_waitqueue, "gss pipe version");
 	return 0;
 out_svc_exit:
@@ -2273,6 +2582,8 @@ out:
 
 static void __exit exit_rpcsec_gss(void)
 {
+	if (use_keyring)
+		unregister_key_type(&key_type_gss_cred);
 	unregister_pernet_subsys(&rpcsec_gss_net_ops);
 	gss_svc_shutdown();
 	rpcauth_unregister(&authgss_ops);
@@ -2293,6 +2604,11 @@ module_param_named(key_expire_timeo,
 MODULE_PARM_DESC(key_expire_timeo, "Time (in seconds) at the end of a "
 		"credential keys lifetime where the NFS layer cleans up "
 		"prior to key expiration");
+
+module_param(use_keyring, bool, 0444);
+MODULE_PARM_DESC(use_keyring,
+		 "Store credentials in keyrings instead of credential cache. "
+		 "Default: false");
 
 module_init(init_rpcsec_gss)
 module_exit(exit_rpcsec_gss)

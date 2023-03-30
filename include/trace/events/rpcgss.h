@@ -626,6 +626,40 @@ TRACE_EVENT(rpcgss_context,
 		__entry->timeout, __entry->len, __get_str(acceptor))
 );
 
+TRACE_EVENT(rpcgss_request_key_result,
+	TP_PROTO(
+		const struct auth_cred *acred,
+		const struct key *key
+	),
+
+	TP_ARGS(acred, key),
+
+	TP_STRUCT__entry(
+		__field(u32, uid)
+		__string(principal, acred->principal)
+		__field(const void *, credkey)
+		__field(int, serial)
+		__field(int, error)
+	),
+
+	TP_fast_assign(
+		__entry->uid = from_kuid(&init_user_ns, acred->cred->fsuid);
+		__assign_str(principal, acred->principal);
+		if (IS_ERR(key)) {
+			__entry->credkey = 0;
+			__entry->serial = 0;
+			__entry->error = PTR_ERR(key);
+		} else {
+			__entry->credkey = key;
+			__entry->serial = key->serial;
+			__entry->error = 0;
+		}
+	),
+
+	TP_printk(" for acred { uid %u princ %s }, key=%px serial=%d error=%d",
+		__entry->uid, __get_str(principal), __entry->credkey,
+		__entry->serial, __entry->error)
+);
 
 /**
  ** Miscellaneous events
@@ -645,24 +679,28 @@ TRACE_DEFINE_ENUM(RPC_AUTH_GSS_KRB5P);
 TRACE_EVENT(rpcgss_createauth,
 	TP_PROTO(
 		unsigned int flavor,
-		int error
+		int error,
+		const struct key *key
 	),
 
-	TP_ARGS(flavor, error),
+	TP_ARGS(flavor, error, key),
 
 	TP_STRUCT__entry(
 		__field(unsigned int, flavor)
 		__field(int, error)
+		__field(const void *, keyring)
 
 	),
 
 	TP_fast_assign(
 		__entry->flavor = flavor;
 		__entry->error = error;
+		__entry->keyring = key;
 	),
 
-	TP_printk("flavor=%s error=%d",
-		show_pseudoflavor(__entry->flavor), __entry->error)
+	TP_printk("flavor=%s error=%d keyring=%px",
+		show_pseudoflavor(__entry->flavor), __entry->error,
+		__entry->keyring)
 );
 
 TRACE_EVENT(rpcgss_oid_to_mech,
