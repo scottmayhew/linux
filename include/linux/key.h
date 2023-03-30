@@ -433,6 +433,10 @@ extern int restrict_link_reject(struct key *keyring,
 
 extern int keyring_clear(struct key *keyring);
 
+extern void keyring_gc_custom(struct key *keyring,
+			      bool (*iterator)(void *object, void *iterator_data),
+			      void *iterator_data);
+
 extern key_ref_t keyring_search(key_ref_t keyring,
 				struct key_type *type,
 				const char *description,

@@ -1795,3 +1795,14 @@ void keyring_restriction_gc(struct key *keyring, struct key_type *dead_type)
 
 	kleave(" [restriction gc]");
 }
+
+void keyring_gc_custom(struct key *keyring,
+		       bool (*iterator)(void *object, void *iterator_data),
+		       void *iterator_data)
+{
+	down_write(&keyring->sem);
+	assoc_array_gc(&keyring->keys, &keyring_assoc_array_ops,
+		       iterator, iterator_data);
+	up_write(&keyring->sem);
+}
+EXPORT_SYMBOL_GPL(keyring_gc_custom);
