@@ -333,7 +333,8 @@ extern struct key *request_key_with_auxdata(struct key_type *type,
 					    struct key_tag *domain_tag,
 					    const void *callout_info,
 					    size_t callout_len,
-					    void *aux);
+					    void *aux,
+					    struct key *dest_keyring);
 
 /**
  * request_key - Request a key and wait for construction
