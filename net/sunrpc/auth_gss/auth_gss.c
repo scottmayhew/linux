@@ -1605,10 +1605,15 @@ gss_cred_init(struct rpc_auth *auth, struct rpc_cred *cred, struct key *authkey)
 static bool gss_cmp(const struct key *key,
 		    const struct key_match_data *match_data)
 {
-	struct gss_cred *gss_cred = rcu_dereference(key->payload.rcu_data0);
+	struct gss_cred *gss_cred;
 	struct rpc_cred *rc;
 	struct gss_cl_ctx *ctx;
 	bool ret;
+
+	if (key->type != &key_type_gss_cred)
+		return false;
+
+	gss_cred = rcu_dereference(key->payload.rcu_data0);
 
 	if (!gss_cred)
 		return false;
